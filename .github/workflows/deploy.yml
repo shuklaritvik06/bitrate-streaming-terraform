@@ -106,83 +106,83 @@ jobs:
           docker push $ECR_REGISTRY/${{ env.ENCODER_REPO }}:latest
 
   package-lambdas:
-      name: Package Lambda Functions
-      runs-on: ubuntu-latest
-      steps:
-        - uses: actions/checkout@v4
+    name: Package Lambda Functions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-        - uses: pnpm/action-setup@v3
-          with:
-            version: 10.25.0
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 10.25.0
 
-        - uses: actions/setup-node@v4
-          with:
-            node-version: 20
-            cache: pnpm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
 
-        - name: Install Dependencies
-          working-directory: services
-          run: pnpm install --frozen-lockfile
+      - name: Install Dependencies
+        working-directory: services
+        run: pnpm install --frozen-lockfile
 
-        - name: Zip Lambdas
-          run: |
-            mkdir -p terraform/lambda_zips
-            zip -j terraform/lambda_zips/push-to-sqs.zip \
-              services/functions/push-sqs-messages/push-to-sqs.js
-            zip -j terraform/lambda_zips/process-sqs-message.zip \
-              services/functions/process-sqs-messages/process-sqs-message.js
+      - name: Zip Lambdas
+        run: |
+          mkdir -p terraform/lambda_zips
+          zip -j terraform/lambda_zips/push-to-sqs.zip \
+            services/functions/push-sqs-messages/push-to-sqs.js
+          zip -j terraform/lambda_zips/process-sqs-message.zip \
+            services/functions/process-sqs-messages/process-sqs-message.js
 
-        - uses: actions/upload-artifact@v4
-          with:
-            name: lambda-zips
-            path: terraform/lambda_zips/
-            retention-days: 1
-            
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lambda-zips
+          path: terraform/lambda_zips/
+          retention-days: 1
+
   terraform-apply:
-      name: Terraform Apply
-      runs-on: ubuntu-latest
-      needs:
-        - build-frontend
-        - build-transcoder
-        - package-lambdas
-      steps:
-        - uses: actions/checkout@v4
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs:
+      - build-frontend
+      - build-transcoder
+      - package-lambdas
+    steps:
+      - uses: actions/checkout@v4
 
-        - name: Configure AWS Credentials
-          uses: aws-actions/configure-aws-credentials@v4
-          with:
-            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-        - uses: hashicorp/setup-terraform@v3
-          with:
-            terraform_version: ${{ env.TF_VERSION }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-        - uses: actions/download-artifact@v4
-          with:
-            name: lambda-zips
-            path: terraform/lambda_zips/
+      - uses: actions/download-artifact@v4
+        with:
+          name: lambda-zips
+          path: terraform/lambda_zips/
 
-        - name: Create tfvars
-          run: |
-            cat > terraform/environments/prod/terraform.tfvars <<EOF
-            desired_count      = 2
-            frontend_image_tag = "${{ github.sha }}"
-            encoder_image_tag  = "${{ github.sha }}"
-            EOF
+      - name: Create tfvars
+        run: |
+          cat > terraform/environments/prod/terraform.tfvars <<EOF
+          desired_count      = 2
+          frontend_image_tag = "${{ github.sha }}"
+          encoder_image_tag  = "${{ github.sha }}"
+          EOF
 
-        - name: Terraform Plan
-          working-directory: terraform
-          run: |
-            chmod +x scripts/plan.sh
-            scripts/plan.sh prod
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          chmod +x scripts/plan.sh
+          scripts/plan.sh prod
 
-        - name: Terraform Apply
-          working-directory: terraform
-          run: |
-            chmod +x scripts/apply.sh
-            scripts/apply.sh prod
+      - name: Terraform Apply
+        working-directory: terraform
+        run: |
+          chmod +x scripts/apply.sh
+          scripts/apply.sh prod
 
   redeploy-ecs:
     name: Force ECS Redeployment
