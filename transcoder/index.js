@@ -1,14 +1,16 @@
-const AWS = require("aws-sdk");
+const {
+  S3Client,
+  GetObjectCommand,
+  PutObjectCommand,
+} = require("@aws-sdk/client-s3");
 const ffmpeg = require("fluent-ffmpeg");
 const fs = require("fs");
 const path = require("path");
 
-const s3 = new AWS.S3({
-  region: "us-west-2",
-});
+const s3 = new S3Client({ region: "us-west-2" });
 
-const bucketName = "web-streamer-ritvik";
-const outputBucketName = "transformed-videos-streamer-ritvik";
+const bucketName = "web-streamer-ritvik-prod";
+const outputBucketName = "transformed-videos-streamer-ritvik-prod";
 
 const resolutions = [
   {
@@ -52,16 +54,13 @@ const downloadFromS3 = async (uuid) => {
   const key = `${uuid}/video_${uuid}.mp4`;
   const localVideoPath = `/tmp/${uuid}.mp4`;
 
-  const params = {
-    Bucket: bucketName,
-    Key: key,
-  };
+  const response = await s3.send(
+    new GetObjectCommand({ Bucket: bucketName, Key: key }),
+  );
 
-  const file = fs.createWriteStream(localVideoPath);
   return new Promise((resolve, reject) => {
-    s3.getObject(params)
-      .createReadStream()
-      .pipe(file)
+    const file = fs.createWriteStream(localVideoPath);
+    response.Body.pipe(file)
       .on("finish", () => resolve(localVideoPath))
       .on("error", reject);
   });
@@ -69,12 +68,13 @@ const downloadFromS3 = async (uuid) => {
 
 const uploadToS3 = async (filePath, targetKey) => {
   const fileContent = fs.readFileSync(filePath);
-  const params = {
-    Bucket: outputBucketName,
-    Key: targetKey,
-    Body: fileContent,
-  };
-  return s3.upload(params).promise();
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: outputBucketName,
+      Key: targetKey,
+      Body: fileContent,
+    }),
+  );
 };
 
 const processVideo = (inputPath, outputDir, resolution, uuid) => {
@@ -92,14 +92,14 @@ const processVideo = (inputPath, outputDir, resolution, uuid) => {
         `-hls_segment_filename ${outputDir}/${resolution.name}_%03d.ts`,
       ])
       .output(`${outputDir}/${resolution.name}.m3u8`)
-      .on("progress", function (progress) {
+      .on("progress", (progress) => {
         console.log(`Processing ${resolution.name}: ${progress.percent}% done`);
       })
-      .on("end", function () {
+      .on("end", () => {
         console.log(`Finished processing ${resolution.name}!`);
         resolve(resolution.name);
       })
-      .on("error", function (err) {
+      .on("error", (err) => {
         console.error(`Error processing video ${resolution.name}:`, err);
         reject(err);
       })
@@ -107,22 +107,22 @@ const processVideo = (inputPath, outputDir, resolution, uuid) => {
   });
 };
 
-const createMasterPlaylist = async (uuid, outputDir) => {
+const createMasterPlaylist = (outputDir) => {
   const masterPlaylistPath = `${outputDir}/master.m3u8`;
-  const masterPlaylistContent = resolutions
-    .map((resolution) => {
-      return `#EXT-X-STREAM-INF:BANDWIDTH=${resolution.bitrate},AVERAGE-BANDWIDTH=${resolution.avgBitrate},RESOLUTION=${resolution.width}x${resolution.height}\n${resolution.name}.m3u8`;
-    })
+  const content = resolutions
+    .map(
+      (r) =>
+        `#EXT-X-STREAM-INF:BANDWIDTH=${r.bitrate},AVERAGE-BANDWIDTH=${r.avgBitrate},RESOLUTION=${r.width}x${r.height}\n${r.name}.m3u8`,
+    )
     .join("\n");
-
-  fs.writeFileSync(masterPlaylistPath, masterPlaylistContent);
+  fs.writeFileSync(masterPlaylistPath, content);
   console.log("Master playlist created successfully!");
-  return masterPlaylistPath;
 };
 
 const transcodeVideo = async (uuid) => {
   const localVideoPath = `/tmp/${uuid}.mp4`;
   const outputDir = `/tmp/${uuid}_output`;
+
   try {
     console.log("Downloading video from S3...");
     await downloadFromS3(uuid);
@@ -130,35 +130,51 @@ const transcodeVideo = async (uuid) => {
     if (!fs.existsSync(outputDir)) {
       fs.mkdirSync(outputDir);
     }
+
     for (const resolution of resolutions) {
       console.log(`Processing video at ${resolution.name}...`);
       await processVideo(localVideoPath, outputDir, resolution, uuid);
     }
+
     console.log("Creating master playlist...");
-    await createMasterPlaylist(uuid, outputDir);
+    createMasterPlaylist(outputDir);
+
     console.log("Uploading HLS files to S3...");
     const files = fs.readdirSync(outputDir);
     for (const file of files) {
       const filePath = path.join(outputDir, file);
       const s3Key = `${uuid}/${file}`;
       await uploadToS3(filePath, s3Key);
+      console.log(`Uploaded: ${s3Key}`);
     }
+
     console.log("All files uploaded successfully!");
   } catch (error) {
     console.error("Error:", error);
+    throw error;
   } finally {
     if (fs.existsSync(localVideoPath)) {
       fs.unlinkSync(localVideoPath);
+    }
+    if (fs.existsSync(outputDir)) {
       fs.rmSync(outputDir, { recursive: true, force: true });
     }
   }
 };
 
 const uuid = process.env.UUID_TO_PROCESS;
+
+if (!uuid) {
+  console.error("UUID_TO_PROCESS env var is required");
+  process.exit(1);
+}
+
 transcodeVideo(uuid)
   .then(() => {
     console.log("Video is transcoded");
+    process.exit(0);
   })
   .catch((err) => {
-    console.log(err);
+    console.error("Transcoding failed:", err);
+    process.exit(1);
   });
