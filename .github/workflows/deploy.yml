@@ -1,0 +1,210 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-west-2
+  TF_VERSION: 1.10.0
+  FRONTEND_REPO: ritvik-web-streamer-prod-frontend
+  ENCODER_REPO: ritvik-web-streamer-prod-encoder
+  ECS_CLUSTER: ritvik-web-streamer-prod-cluster
+  ECS_SERVICE: ritvik-web-streamer-prod-frontend-service
+  SECRET_ID: webstream/prod/frontend
+  VIDEOS_BUCKET: web-streamer-ritvik-prod
+  STREAM_URL: https://transformed-videos-streamer-ritvik-prod.s3.us-west-2.amazonaws.com
+
+jobs:
+  build-frontend:
+    name: Build and Push Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Write Secrets to Secrets Manager
+        run: |
+          SECRET_JSON=$(jq -n \
+            --arg region "${{ env.AWS_REGION }}" \
+            --arg key_id "${{ secrets.AWS_ACCESS_KEY_ID }}" \
+            --arg secret "${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            --arg bucket "${{ env.VIDEOS_BUCKET }}" \
+            --arg stream_url "${{ env.STREAM_URL }}" \
+            '{
+              APP_AWS_REGION: $region,
+              APP_AWS_ACCESS_KEY_ID: $key_id,
+              APP_AWS_SECRET_ACCESS_KEY: $secret,
+              VIDEOS_BUCKET: $bucket,
+              NEXT_PUBLIC_STREAM_URL: $stream_url
+            }')
+          aws secretsmanager put-secret-value \
+            --secret-id "${{ env.SECRET_ID }}" \
+            --secret-string "$SECRET_JSON"
+
+      - name: Fetch Secret for Docker Build
+        id: fetch_secret
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id "${{ env.SECRET_ID }}" \
+            --query 'SecretString' \
+            --output text)
+          echo "secret_value<<EOF" >> $GITHUB_OUTPUT
+          echo "$SECRET" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Frontend
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          SECRETS: ${{ steps.fetch_secret.outputs.secret_value }}
+        run: |
+          docker build \
+            --build-arg SECRETS="$SECRETS" \
+            -t $ECR_REGISTRY/${{ env.FRONTEND_REPO }}:${{ github.sha }} \
+            -t $ECR_REGISTRY/${{ env.FRONTEND_REPO }}:latest \
+            -f Dockerfile .
+          docker push $ECR_REGISTRY/${{ env.FRONTEND_REPO }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/${{ env.FRONTEND_REPO }}:latest
+
+  build-transcoder:
+    name: Build and Push Transcoder
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and Push Transcoder
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          docker build \
+            -t $ECR_REGISTRY/${{ env.ENCODER_REPO }}:${{ github.sha }} \
+            -t $ECR_REGISTRY/${{ env.ENCODER_REPO }}:latest \
+            -f transcoder/Dockerfile transcoder/
+          docker push $ECR_REGISTRY/${{ env.ENCODER_REPO }}:${{ github.sha }}
+          docker push $ECR_REGISTRY/${{ env.ENCODER_REPO }}:latest
+
+  package-lambdas:
+      name: Package Lambda Functions
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v4
+
+        - uses: pnpm/action-setup@v3
+          with:
+            version: 10.25.0
+
+        - uses: actions/setup-node@v4
+          with:
+            node-version: 20
+            cache: pnpm
+
+        - name: Install Dependencies
+          working-directory: services
+          run: pnpm install --frozen-lockfile
+
+        - name: Zip Lambdas
+          run: |
+            mkdir -p terraform/lambda_zips
+            zip -j terraform/lambda_zips/push-to-sqs.zip \
+              services/functions/push-sqs-messages/push-to-sqs.js
+            zip -j terraform/lambda_zips/process-sqs-message.zip \
+              services/functions/process-sqs-messages/process-sqs-message.js
+
+        - uses: actions/upload-artifact@v4
+          with:
+            name: lambda-zips
+            path: terraform/lambda_zips/
+            retention-days: 1
+            
+  terraform-apply:
+      name: Terraform Apply
+      runs-on: ubuntu-latest
+      needs:
+        - build-frontend
+        - build-transcoder
+        - package-lambdas
+      steps:
+        - uses: actions/checkout@v4
+
+        - name: Configure AWS Credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-region: ${{ env.AWS_REGION }}
+
+        - uses: hashicorp/setup-terraform@v3
+          with:
+            terraform_version: ${{ env.TF_VERSION }}
+
+        - uses: actions/download-artifact@v4
+          with:
+            name: lambda-zips
+            path: terraform/lambda_zips/
+
+        - name: Create tfvars
+          run: |
+            cat > terraform/environments/prod/terraform.tfvars <<EOF
+            desired_count      = 2
+            frontend_image_tag = "${{ github.sha }}"
+            encoder_image_tag  = "${{ github.sha }}"
+            EOF
+
+        - name: Terraform Plan
+          working-directory: terraform
+          run: |
+            chmod +x scripts/plan.sh
+            scripts/plan.sh prod
+
+        - name: Terraform Apply
+          working-directory: terraform
+          run: |
+            chmod +x scripts/apply.sh
+            scripts/apply.sh prod
+
+  redeploy-ecs:
+    name: Force ECS Redeployment
+    runs-on: ubuntu-latest
+    needs: terraform-apply
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Force New Deployment
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment
+
+      - name: Wait for Stability
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }}
